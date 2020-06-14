@@ -1,0 +1,676 @@
+#!/usr/bin/env node
+
+const crypto = require('crypto')
+const fs = require('fs')
+const path = require('path')
+const process = require('process')
+const readline = require('readline')
+const { PassThrough } = require('stream')
+
+const PROGRAM_NAME = 'S7'
+const ALGORITHM = 'aes-256-gcm'
+const KEYLEN = 32
+const IV_LEN_IN_BYTES = 16
+const AUTH_LEN_IN_BYTES = 16
+const HEADER_LENGTH = 1
+
+async function main () {
+  try {
+    await run()
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+async function run () {
+  checkArgv(process.argv)
+  const command = await parseCommand(process.argv)
+  if (command === 'sync') {
+    const [source, target] = await parseSyncIo(process.argv)
+    await sync(source, target)
+  } else if (command === 'restore') {
+    const io = await parseRestoreIo(process.argv)
+    await restore(io)
+  } else {
+    exitWithMessage(`Unknown command ${command}`)
+  }
+}
+
+function printUsage () {
+  const usage =
+`
+--secrets takes a file arg to pass secrets to s7
+
+s7 sync [source] [target]
+where source/target is either
+- file://path/to/root
+- s3://prefix
+and can be prepended with 'enc+' to enable client-side encryption
+
+The sync command synchronizes target with source, ensuring the conents of
+target match source.
+
+--storage-class sets the Storage Class on S3 targets
+The default value is DEEP_ARCHIVE
+
+Example:
+s7 --secrets=<(get_secrets) sync file://files enc+s3://mybucket/files
+- syncs a local directory 'files' to an S3 bucket named 'mybucket'
+  under a prefix 'files' with encrypted data being sent to S3
+
+s7 --secrets=<(get_secrets) restore [source]
+where source is s3://prefix
+and can be prepended with 'enc+' to enable client-side encryption
+
+The restore command restores S3 objects from Glacier storage to Standard. This
+is required before syncing if the objects are in Glacier.
+
+--restore-request set the RestoreRequest parameters
+The default value is
+{
+  Days: 5,
+  GlacierJobParameters: {
+    Tier: "Bulk"
+  }
+}
+`
+  console.log(usage)
+}
+
+function exit () {
+  process.exit(1)
+}
+
+function checkArgv (argv) {
+  if (!argv[0].match(/node/) || !argv[1].match(/s7/)) {
+    throw new Error('Expected argv to start with "node s7"')
+  }
+}
+
+const ARG_START = 2
+
+async function parseCommand (argv) {
+  const args = pruneOptions(argv)
+  const command = args[ARG_START]
+  return command
+}
+
+async function parseSyncIo (argv) {
+  const options = parseOptions(argv)
+  const args = pruneOptions(argv)
+  let secrets
+  if (options.secrets !== undefined) {
+    secrets = await parseSecrets(options.secrets)
+  }
+  precondition(args.length === 5, `Expected 5 args but found ${args.length}. args=${args}`)
+
+  const source = args[ARG_START + 1]
+  const sourceIo = parseUri(secrets, source, options)
+
+  const target = args[ARG_START + 2]
+  const targetIo = parseUri(secrets, target, options)
+
+  return [sourceIo, targetIo]
+}
+
+async function parseRestoreIo (argv) {
+  const options = parseOptions(argv)
+  const args = pruneOptions(argv)
+  const secrets = await parseSecrets(options.secrets)
+  const io = parseUri(secrets, args[ARG_START + 1], options)
+  return io
+}
+
+function exitWithMessage (message) {
+  console.error(message)
+  printUsage()
+  exit()
+}
+
+function precondition (check, message) {
+  if (!check) {
+    exitWithMessage(message)
+  }
+}
+
+function parseUri (secrets, uri, options) {
+  const regex = /(enc\+)*(file|s3):\/\/(.*)/
+  const matches = uri.match(regex)
+  const encEnabled = matches[1] === 'enc+'
+  const scheme = matches[2]
+
+  precondition(scheme !== undefined, `Unknown scheme ${scheme}`)
+
+  const pathArg = matches[3]
+
+  precondition(pathArg !== undefined, 'Root must not be empty')
+
+  let io
+  if (scheme === 'file') {
+    const root = pathArg
+    io = fsIO.create(root)
+  } else if (scheme === 's3') {
+    precondition(secrets && secrets.accessKeyId, 'Secrets did not include "accessKeyId"')
+    precondition(secrets && secrets.secretAccessKey, 'Secrets did not include "secretAccessKey"')
+    precondition(secrets && secrets.region, 'Secrets did not include "region"')
+    const storageClass = options['storage-class']
+    const restoreRequest = options['restore-request'] !== undefined ? JSON.parse(options['restore-request']) : undefined
+
+    const splitIdx = pathArg.search(/[/]/)
+    if (splitIdx === -1) {
+      const bucket = pathArg
+      const prefix = ''
+      io = s3IO.create(secrets.accessKeyId, secrets.secretAccessKey, secrets.region, bucket, prefix, storageClass, restoreRequest)
+    } else {
+      const bucket = pathArg.slice(0, splitIdx)
+      const prefix = pathArg.slice(splitIdx + 1)
+      io = s3IO.create(secrets.accessKeyId, secrets.secretAccessKey, secrets.region, bucket, prefix, storageClass, restoreRequest)
+    }
+  } else {
+    exitWithMessage(`Unknown scheme ${scheme}`)
+  }
+
+  if (encEnabled) {
+    precondition(secrets && secrets.password, 'Secrets did not include "password"')
+    io = encIO.create(secrets.password, io)
+  }
+
+  return io
+}
+
+function parseOptions (args) {
+  const allowedOptions = ['storage-class', 'restore-request', 'secrets']
+  const options = {}
+  for (const arg of args) {
+    if (arg.startsWith('--')) {
+      precondition(arg.indexOf('=') !== -1, `Did not find value when parsing ${arg}. Expected the form --key=value`)
+      const [key, value] = arg.slice(2).split('=')
+      precondition(key.length !== 0, `Missing key when parsing ${arg}. Expected the form --key=value`)
+      precondition(value.length !== 0, `Missing value when parsing ${arg}. Expected the form --key=value`)
+      precondition(allowedOptions.indexOf(key) !== -1, `Unsupported option ${key}. Allowed options are ${allowedOptions}.`)
+      options[key] = value
+    }
+  }
+  return options
+}
+
+function pruneOptions (args) {
+  return args.filter(a => !a.startsWith('--'))
+}
+
+// Following https://www.netmeister.org/blog/passing-passwords.html
+function parseSecrets (secrets) {
+  return new Promise((resolve, reject) => {
+    const rl = readline.createInterface({
+      input: fs.createReadStream(secrets),
+      output: null
+    })
+
+    rl.question('Enter secrets as JSON object, e.g. "{"password":"secret"}":\n', (answer) => {
+      const secrets = JSON.parse(answer)
+      rl.close()
+      resolve(secrets)
+    })
+  })
+}
+
+async function sync (sourceIo, targetIo) {
+  console.log(`Sync started from ${sourceIo} to ${targetIo}`)
+  const actions = await mergeUnsorted(sourceIo.list(), targetIo.list())
+  const stats = {
+    added: 0,
+    updated: 0,
+    deleted: 0
+  }
+  for await (const action of actions) {
+    if (action.action === 'add') {
+      await copy(sourceIo, targetIo, action.entry)
+      stats.added += 1
+    } else if (action.action === 'update') {
+      await copy(sourceIo, targetIo, action.entry)
+      stats.updated += 1
+    } else if (action.action === 'delete') {
+      await remove(targetIo, action.entry)
+      stats.deleted += 1
+    } else {
+      const message = `Unknown action ${action.action}`
+      throw new Error(message)
+    }
+  }
+  console.log(`Sync finished with ${stats.added} file(s) added, ${stats.updated} file(s) updated, and ${stats.deleted} file(s) deleted`)
+}
+
+async function restore (io) {
+  console.log(`Restore started for ${io}`)
+  for await (const entry of io.list()) {
+    await io.restore(entry.path)
+  }
+  console.log(`Restore finished for ${io}`)
+}
+
+// Following logic from `aws s3 sync` here: https://github.com/aws/aws-cli/blob/ed821d73f4d418e89cf9ecbe93de22c480454d7d/awscli/customizations/s3/comparator.py#L20
+async function * merge (source, target) {
+  let s = await source.next()
+  let t = await target.next()
+  while (!s.done || !t.done) {
+    if (t.done || (!s.done && s.value.path.localeCompare(t.value.path) < 0)) {
+      const action = {
+        action: 'add',
+        entry: s.value
+      }
+      yield action
+      s = await source.next()
+    } else if (s.done || (!t.done && s.value.path.localeCompare(t.value.path) > 0)) {
+      const action = {
+        action: 'delete',
+        entry: t.value
+      }
+      yield action
+      t = await target.next()
+    } else {
+      if (s.value.size !== t.value.size || s.value.mtimeMs - t.value.mtimeMs >= 1) {
+        const action = {
+          action: 'update',
+          entry: s.value
+        }
+        yield action
+      }
+      s = await source.next()
+      t = await target.next()
+    }
+  }
+}
+
+/* Listing encrypted locations in alphabetic order will not be in file path order.
+ * The merge needs to process files in sorted file path order.
+ * The sort requires pulling all of the filenames into memory, which limits
+ * the total number of files that can be synced. Practically the limit
+ * should be in the millions of files.
+ */
+async function * mergeUnsorted (source, target) {
+  const collectedSource = await collect(source)
+  const collectedTarget = await collect(target)
+
+  collectedSource.sort((a, b) => a.path.localeCompare(b.path))
+  collectedTarget.sort((a, b) => a.path.localeCompare(b.path))
+
+  async function * sortedSource () {
+    yield * collectedSource
+  }
+
+  async function * sortedTarget () {
+    yield * collectedTarget
+  }
+
+  yield * merge(sortedSource(), sortedTarget())
+}
+
+async function copy (sourceIo, targetIo, entry) {
+  console.log(`Copying ${entry.path} from ${sourceIo} to ${targetIo}`)
+  return targetIo.write(entry.path, await sourceIo.read(entry.path))
+}
+
+async function remove (io, entry) {
+  console.log(`Removing ${entry.path} from ${io}`)
+  return io.remove(entry.path)
+}
+
+const fsIO = {
+  create: function (root) {
+    return Object.create(fsIO, {
+      root: {
+        value: root
+      }
+    })
+  },
+  toString: function () {
+    return `file://${this.root}`
+  },
+  list: async function * () {
+    for await (const e of walk(this.root)) {
+      const entryStats = {
+        path: path.relative(this.root, e.path),
+        mtimeMs: e.mtimeMs,
+        size: e.size
+      }
+      yield entryStats
+    }
+  },
+  read: async function (name) {
+    const fullPath = path.join(this.root, name)
+    return fs.createReadStream(fullPath)
+  },
+  write: async function (name, stream) {
+    const fullPath = path.join(this.root, name)
+    await fs.promises.mkdir(path.dirname(fullPath), { recursive: true })
+    return new Promise((resolve, reject) => {
+      const writeStream = fs.createWriteStream(fullPath)
+      writeStream.on('finish', async () => {
+        resolve(writeStream)
+      })
+      stream.pipe(writeStream)
+    })
+  },
+  remove: async function (name) {
+    const fullPath = path.join(this.root, name)
+    return fs.promises.unlink(fullPath)
+  }
+}
+
+function * yieldContents (contents, prefix) {
+  for (const content of contents) {
+    const entryStats = {
+      path: path.relative(prefix, content.Key),
+      mtimeMs: Date.parse(content.LastModified),
+      size: content.Size
+    }
+    yield entryStats
+  }
+}
+
+const s3IO = {
+  create: function (accessKeyId, secretAccessKey, region, bucket, prefix, storageClass = undefined, restoreRequest = undefined) {
+    const AWS = require('aws-sdk')
+
+    const defaultStorageClass = 'DEEP_ARCHIVE'
+    storageClass = storageClass === undefined ? defaultStorageClass : storageClass
+
+    const defaultRestoreRequest = {
+      Days: 5,
+      GlacierJobParameters: {
+        Tier: 'Bulk'
+      }
+    }
+    restoreRequest = restoreRequest === undefined ? defaultRestoreRequest : restoreRequest
+
+    const s3Io = Object.create(s3IO, {
+      bucket: {
+        value: bucket
+      },
+      prefix: {
+        value: prefix
+      },
+      storageClass: {
+        value: storageClass
+      },
+      restoreRequest: {
+        value: restoreRequest
+      },
+      s3: {
+        value: new AWS.S3({
+          accessKeyId: accessKeyId,
+          secretAccessKey: secretAccessKey,
+          region: region
+        })
+      }
+    })
+    return s3Io
+  },
+  toString: function () {
+    return `s3://${this.bucket}/${this.prefix}`
+  },
+  list: async function * () {
+    const params = {
+      Bucket: this.bucket,
+      Prefix: this.prefix
+    }
+    let objects = await this.s3.listObjectsV2(params).promise()
+    yield * yieldContents(objects.Contents, this.prefix)
+    while (objects.IsTruncated) {
+      const params = {
+        Bucket: this.bucket,
+        ContinuationToken: objects.NextContinuationToken
+      }
+      objects = await this.s3.listObjectsV2(params).promise()
+      yield * yieldContents(objects.Contents, this.prefix)
+    }
+  },
+  read: async function (name) {
+    var params = {
+      Bucket: this.bucket,
+      Key: path.join(this.prefix, name)
+    }
+    const stream = this.s3.getObject(params).createReadStream()
+    return stream
+  },
+  write: async function (name, stream) {
+    const params = {
+      Bucket: this.bucket,
+      Key: path.join(this.prefix, name),
+      Body: stream,
+      StorageClass: this.storageClass
+    }
+    const managedUpload = this.s3.upload(params)
+    return managedUpload.promise()
+  },
+  remove: async function (name) {
+    var params = {
+      Bucket: this.bucket,
+      Key: path.join(this.prefix, name)
+    }
+    return this.s3.deleteObject(params).promise()
+  },
+  restore: async function (name) {
+    const params = {
+      Bucket: this.bucket,
+      Key: path.join(this.prefix, name),
+      RestoreRequest: this.restoreRequest
+    }
+    return this.s3.restoreObject(params).promise()
+  }
+}
+
+const encIO = {
+  create: function (password, io) {
+    return Object.create(encIO, {
+      io: {
+        value: io
+      },
+      password: {
+        value: password
+      }
+    })
+  },
+  toString: function () {
+    return `enc+${this.io.toString()}`
+  },
+  list: async function * () {
+    for await (const e of this.io.list()) {
+      const entryStats = {
+        path: await decryptName(this.password, e.path),
+        mtimeMs: e.mtimeMs,
+        size: e.size - HEADER_LENGTH - IV_LEN_IN_BYTES - AUTH_LEN_IN_BYTES
+      }
+      yield entryStats
+    }
+  },
+  read: async function (name) {
+    const encryptedName = await encryptName(this.password, name)
+    const encryptedRead = await this.io.read(encryptedName)
+    const decryptedStream = await decipher(this.password, encryptedRead)
+    return decryptedStream
+  },
+  write: async function (name, stream) {
+    const encryptedName = await encryptName(this.password, name)
+    const encryptedStream = cipher(this.password, stream)
+    const outStream = await this.io.write(encryptedName, encryptedStream)
+    return outStream
+  },
+  remove: async function (name) {
+    const encryptedName = await encryptName(this.password, name)
+    return this.io.remove(encryptedName)
+  },
+  restore: async function (name) {
+    const encryptedName = await encryptName(this.password, name)
+    return this.io.restore(encryptedName)
+  }
+}
+
+function cipher (password, input, iv = undefined) {
+  if (iv === undefined) {
+    iv = crypto.randomBytes(IV_LEN_IN_BYTES)
+  }
+
+  const key = getKey(password)
+  const cipher = crypto.createCipheriv(ALGORITHM, key, iv)
+
+  const header = Buffer.alloc(HEADER_LENGTH)
+  header.writeUInt8(1, 0) // version
+
+  const authIvEnc = new PassThrough()
+
+  cipher.on('end', () => {
+    const auth = cipher.getAuthTag()
+    authIvEnc.write(auth)
+    authIvEnc.end()
+  })
+  cipher.on('error', e => { throw new Error(e) })
+  input.on('error', e => { throw new Error(e) })
+
+  authIvEnc.write(header)
+  authIvEnc.write(iv)
+  input.pipe(cipher).pipe(authIvEnc, { end: false })
+
+  return authIvEnc
+}
+
+function decipher (password, stream) {
+  return new Promise((resolve, reject) => {
+    let decipher
+    let authBuffer
+    stream.on('error', reject)
+    stream.on('readable', () => {
+      if (decipher === undefined) {
+        const headerIv = stream.read(HEADER_LENGTH + IV_LEN_IN_BYTES)
+        if (headerIv !== null) {
+          const header = headerIv.slice(0, HEADER_LENGTH)
+          const version = header.readUInt8(0)
+          if (version !== 1) {
+            throw new Error('Unsupported version')
+          }
+          const iv = headerIv.slice(HEADER_LENGTH, HEADER_LENGTH + IV_LEN_IN_BYTES)
+          const key = getKey(password)
+          decipher = crypto.createDecipheriv(ALGORITHM, key, iv)
+        }
+      }
+      let chunk
+      while (decipher !== undefined && (chunk = stream.read()) !== null) {
+        if (authBuffer !== undefined) {
+          decipher.write(authBuffer)
+        }
+        const data = chunk.slice(0, chunk.length - AUTH_LEN_IN_BYTES)
+        decipher.write(data)
+        authBuffer = chunk.slice(chunk.length - AUTH_LEN_IN_BYTES)
+      }
+      if (decipher !== undefined) {
+        resolve(decipher)
+      }
+    })
+    stream.on('end', () => {
+      if (decipher === undefined) {
+        reject(new Error('Found of end of input before decipher created!'))
+      } else if (authBuffer === undefined) {
+        reject(new Error('Auth not set before end of stream!'))
+      } else {
+        const auth = authBuffer
+        decipher.setAuthTag(auth)
+        decipher.end()
+      }
+    })
+  })
+}
+
+function streamToString (stream, encoding = 'base64') {
+  const chunks = []
+  return new Promise((resolve, reject) => {
+    stream.on('data', chunk => chunks.push(chunk))
+    stream.on('error', reject)
+    stream.on('end', () => resolve(Buffer.concat(chunks).toString(encoding)))
+  })
+}
+
+function stringToStream (string, encoding = 'utf8') {
+  const stream = new PassThrough()
+  stream.write(Buffer.from(string, encoding))
+  stream.end()
+  return stream
+}
+
+function getKey (password) {
+  const key = crypto.scryptSync(password, 'salt', KEYLEN)
+  return key
+}
+
+async function encryptString (password, str, iv = undefined, encoding = 'base64') {
+  const strStream = stringToStream(str, 'utf8')
+  const stream = cipher(password, strStream, iv)
+  const encStr = await streamToString(stream, encoding)
+  return encStr
+}
+
+async function decryptString (password, str, encoding = 'base64') {
+  const strStream = stringToStream(str, encoding)
+  const stream = await decipher(password, strStream)
+  const deStr = await streamToString(stream, 'utf8')
+  return deStr
+}
+
+// Following https://docs.microsoft.com/en-us/sql/relational-databases/security/encryption/always-encrypted-cryptography
+function generateSyntheticIV (password, filename) {
+  const hmac = crypto.createHmac('sha256', password)
+  hmac.update(PROGRAM_NAME + ALGORITHM + password.length)
+  const ivKey = hmac.digest()
+
+  const ivHmac = crypto.createHmac('sha256', ivKey)
+  ivHmac.update(filename)
+  const hmacDigest = ivHmac.digest()
+  const iv = hmacDigest.slice(IV_LEN_IN_BYTES)
+
+  return iv
+}
+
+function safeBase64Encode (base64Str) {
+  return base64Str.replace(/[/]/g, '_')
+}
+
+function safeBase64Decode (safebase64Str) {
+  return safebase64Str.replace(/_/g, '/')
+}
+
+async function encryptName (password, name) {
+  const iv = generateSyntheticIV(password, name)
+  const key = safeBase64Encode(await encryptString(password, name, iv))
+  return key
+}
+
+async function decryptName (password, key) {
+  const name = await decryptString(password, safeBase64Decode(key))
+  return name
+}
+
+// https://gist.github.com/lovasoa/8691344
+async function * walk (dir) {
+  for await (const d of await fs.promises.opendir(dir)) {
+    const entry = path.join(dir, d.name)
+    if (d.isDirectory()) yield * walk(entry)
+    else if (d.isFile()) {
+      const stats = await fs.promises.stat(entry)
+      const entryStats = {
+        path: entry,
+        mtimeMs: stats.mtimeMs,
+        size: stats.size
+      }
+      yield entryStats
+    }
+  }
+}
+
+async function collect (asyncIter) {
+  const out = []
+  for await (const e of asyncIter) {
+    out.push(e)
+  }
+  return out
+}
+
+main()
