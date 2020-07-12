@@ -419,6 +419,7 @@ const s3IO = {
     while (objects.IsTruncated) {
       const params = {
         Bucket: this.bucket,
+        Prefix: this.prefix,
         ContinuationToken: objects.NextContinuationToken
       }
       objects = await this.s3.listObjectsV2(params).promise()
