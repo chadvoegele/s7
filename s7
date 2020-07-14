@@ -172,7 +172,8 @@ function parseUri (secrets, uri, options) {
 
   if (encEnabled) {
     precondition(secrets && secrets.password, 'Secrets did not include "password"')
-    io = encIO.create(secrets.password, io)
+    const key = getKey(secrets.password)
+    io = encIO.create(key, io)
   }
 
   return io
@@ -462,13 +463,13 @@ const s3IO = {
 }
 
 const encIO = {
-  create: function (password, io) {
+  create: function (key, io) {
     return Object.create(encIO, {
       io: {
         value: io
       },
-      password: {
-        value: password
+      key: {
+        value: key
       }
     })
   },
@@ -478,7 +479,7 @@ const encIO = {
   list: async function * () {
     for await (const e of this.io.list()) {
       const entryStats = {
-        path: await decryptName(this.password, e.path),
+        path: await decryptName(this.key, e.path),
         mtimeMs: e.mtimeMs,
         size: e.size - HEADER_LENGTH - IV_LEN_IN_BYTES - AUTH_LEN_IN_BYTES
       }
@@ -486,33 +487,32 @@ const encIO = {
     }
   },
   read: async function (name) {
-    const encryptedName = await encryptName(this.password, name)
+    const encryptedName = await encryptName(this.key, name)
     const encryptedRead = await this.io.read(encryptedName)
-    const decryptedStream = await decipher(this.password, encryptedRead)
+    const decryptedStream = await decipher(this.key, encryptedRead)
     return decryptedStream
   },
   write: async function (name, stream) {
-    const encryptedName = await encryptName(this.password, name)
-    const encryptedStream = cipher(this.password, stream)
+    const encryptedName = await encryptName(this.key, name)
+    const encryptedStream = cipher(this.key, stream)
     const outStream = await this.io.write(encryptedName, encryptedStream)
     return outStream
   },
   remove: async function (name) {
-    const encryptedName = await encryptName(this.password, name)
+    const encryptedName = await encryptName(this.key, name)
     return this.io.remove(encryptedName)
   },
   restore: async function (name) {
-    const encryptedName = await encryptName(this.password, name)
+    const encryptedName = await encryptName(this.key, name)
     return this.io.restore(encryptedName)
   }
 }
 
-function cipher (password, input, iv = undefined) {
+function cipher (key, input, iv = undefined) {
   if (iv === undefined) {
     iv = crypto.randomBytes(IV_LEN_IN_BYTES)
   }
 
-  const key = getKey(password)
   const cipher = crypto.createCipheriv(ALGORITHM, key, iv)
 
   const header = Buffer.alloc(HEADER_LENGTH)
@@ -535,7 +535,7 @@ function cipher (password, input, iv = undefined) {
   return authIvEnc
 }
 
-function decipher (password, stream) {
+function decipher (key, stream) {
   return new Promise((resolve, reject) => {
     let decipher
     let authBuffer
@@ -550,7 +550,6 @@ function decipher (password, stream) {
             throw new Error('Unsupported version')
           }
           const iv = headerIv.slice(HEADER_LENGTH, HEADER_LENGTH + IV_LEN_IN_BYTES)
-          const key = getKey(password)
           decipher = crypto.createDecipheriv(ALGORITHM, key, iv)
         }
       }
@@ -602,24 +601,24 @@ function getKey (password) {
   return key
 }
 
-async function encryptString (password, str, iv = undefined, encoding = 'base64') {
+async function encryptString (key, str, iv = undefined, encoding = 'base64') {
   const strStream = stringToStream(str, 'utf8')
-  const stream = cipher(password, strStream, iv)
+  const stream = cipher(key, strStream, iv)
   const encStr = await streamToString(stream, encoding)
   return encStr
 }
 
-async function decryptString (password, str, encoding = 'base64') {
+async function decryptString (key, str, encoding = 'base64') {
   const strStream = stringToStream(str, encoding)
-  const stream = await decipher(password, strStream)
+  const stream = await decipher(key, strStream)
   const deStr = await streamToString(stream, 'utf8')
   return deStr
 }
 
 // Following https://docs.microsoft.com/en-us/sql/relational-databases/security/encryption/always-encrypted-cryptography
-function generateSyntheticIV (password, filename) {
-  const hmac = crypto.createHmac('sha256', password)
-  hmac.update(PROGRAM_NAME + ALGORITHM + password.length)
+function generateSyntheticIV (key, filename) {
+  const hmac = crypto.createHmac('sha256', key)
+  hmac.update(PROGRAM_NAME + ALGORITHM)
   const ivKey = hmac.digest()
 
   const ivHmac = crypto.createHmac('sha256', ivKey)
@@ -638,14 +637,14 @@ function safeBase64Decode (safebase64Str) {
   return safebase64Str.replace(/_/g, '/')
 }
 
-async function encryptName (password, name) {
-  const iv = generateSyntheticIV(password, name)
-  const key = safeBase64Encode(await encryptString(password, name, iv))
-  return key
+async function encryptName (key, name) {
+  const iv = generateSyntheticIV(key, name)
+  const encrypted_name = safeBase64Encode(await encryptString(key, name, iv))
+  return encrypted_name
 }
 
-async function decryptName (password, key) {
-  const name = await decryptString(password, safeBase64Decode(key))
+async function decryptName (key, encrypted_name) {
+  const name = await decryptString(key, safeBase64Decode(encrypted_name))
   return name
 }
 
