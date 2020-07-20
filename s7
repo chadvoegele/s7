@@ -117,7 +117,9 @@ async function parseRestoreIo (argv) {
   const options = parseOptions(argv)
   const args = pruneOptions(argv)
   const secrets = await parseSecrets(options.secrets)
-  const io = parseUri(secrets, args[ARG_START + 1], options)
+  const target = args[ARG_START + 1]
+  precondition(target.startsWith('s3://'), `restore requires s3:// target but found ${target}`)
+  const io = parseUri(secrets, target, options)
   return io
 }
 
@@ -241,12 +243,15 @@ async function sync (sourceIo, targetIo) {
   console.log(`Sync finished with ${stats.added} file(s) added, ${stats.updated} file(s) updated, and ${stats.deleted} file(s) deleted`)
 }
 
-async function restore (io) {
-  console.log(`Restore started for ${io}`)
-  for await (const entry of io.list()) {
-    await io.restore(entry.path)
+async function restore (s3Io) {
+  console.log(`Restore started for ${s3Io}`)
+  for await (const entry of s3Io.list()) {
+    const head = await s3Io.head(entry.path)
+    if (head.Restore === undefined) {
+      await s3Io.restore(entry.path)
+    }
   }
-  console.log(`Restore finished for ${io}`)
+  console.log(`Restore finished for ${s3Io}`)
 }
 
 // Following logic from `aws s3 sync` here: https://github.com/aws/aws-cli/blob/ed821d73f4d418e89cf9ecbe93de22c480454d7d/awscli/customizations/s3/comparator.py#L20
@@ -459,6 +464,13 @@ const s3IO = {
       RestoreRequest: this.restoreRequest
     }
     return this.s3.restoreObject(params).promise()
+  },
+  head: async function (name) {
+    const params = {
+      Bucket: this.bucket,
+      Key: path.join(this.prefix, name),
+    }
+    return this.s3.headObject(params).promise()
   }
 }
 

@@ -15,6 +15,7 @@ function main() {
     run_test test_s3_multiple_prefixes "$TEST_DIR"
     [[ -n $S7_LONG_TESTS ]] && run_test test_s3_list_pages "$TEST_DIR"
     [[ -n $S7_LONG_TESTS ]] && run_test test_s3_restore "$TEST_DIR"
+    [[ -n $S7_LONG_TESTS ]] && run_test test_s3_restore_after_restore "$TEST_DIR"
   else
     echo "To run S3 tests, set the environment variables AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION"
   fi
@@ -201,7 +202,7 @@ function test_s3_restore() {
   echo "test data" > "$test_dir/data/in/test.txt"
   in_sync=$(aws_s7 sync --storage-class=GLACIER file://"$test_dir/data/in" enc+s3://s7tests/prefix)
   assert_in "$in_sync" "1 file(s) added"
-  aws_s7 restore --restore-request="{\"Days\":1,\"GlacierJobParameters\":{\"Tier\":\"Expedited\"}}" enc+s3://s7tests/prefix > /dev/null
+  aws_s7 restore --restore-request="{\"Days\":1,\"GlacierJobParameters\":{\"Tier\":\"Expedited\"}}" s3://s7tests/prefix > /dev/null
   # Per https://docs.aws.amazon.com/AmazonS3/latest/API/API_RestoreObject.html,
   # For all but the largest archived objects (250 MB+), data accessed using Expedited retrievals are typically made available within 1–5 minutes.
   sleep 300
@@ -213,6 +214,29 @@ function test_s3_restore() {
 
   # Clear bucket
   rm "$test_dir/data/in/test.txt"
+  aws_s7 sync file://"$test_dir/data/in" enc+s3://s7tests/prefix > /dev/null
+}
+
+function test_s3_restore_after_restore() {
+  test_dir="$1"
+  mkdir -p "$test_dir"/data/{in,out}
+  echo "test data" > "$test_dir/data/in/test1.txt"
+  aws_s7 sync --storage-class=GLACIER file://"$test_dir/data/in" enc+s3://s7tests/prefix > /dev/null
+  aws_s7 restore --restore-request="{\"Days\":1,\"GlacierJobParameters\":{\"Tier\":\"Expedited\"}}" s3://s7tests/prefix > /dev/null
+  echo "test data" > "$test_dir/data/in/test2.txt"
+  aws_s7 sync --storage-class=GLACIER file://"$test_dir/data/in" enc+s3://s7tests/prefix > /dev/null
+  aws_s7 restore --restore-request="{\"Days\":1,\"GlacierJobParameters\":{\"Tier\":\"Expedited\"}}" s3://s7tests/prefix > /dev/null
+  # Per https://docs.aws.amazon.com/AmazonS3/latest/API/API_RestoreObject.html,
+  # For all but the largest archived objects (250 MB+), data accessed using Expedited retrievals are typically made available within 1–5 minutes.
+  sleep 300
+  out_sync=$(aws_s7 sync enc+s3://s7tests/prefix file://"$test_dir/data/out")
+  assert_in "$out_sync" "2 file(s) added"
+  diff -r "$test_dir/data/in" "$test_dir/data/out"
+  diff_exit="$?"
+  assert_eq "$diff_exit" "0"
+
+  # Clear bucket
+  rm "$test_dir"/data/in/{test1,test2}.txt
   aws_s7 sync file://"$test_dir/data/in" enc+s3://s7tests/prefix > /dev/null
 }
 
