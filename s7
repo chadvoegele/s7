@@ -247,7 +247,8 @@ async function restore (s3Io) {
   console.log(`Restore started for ${s3Io}`)
   for await (const entry of s3Io.list()) {
     const head = await s3Io.head(entry.path)
-    if (head.Restore === undefined) {
+    if (head.Restore === undefined || head.Restore.indexOf('ongoing-request="false"') !== -1) {
+      console.log(`Restoring ${entry.path} for ${s3Io}`)
       await s3Io.restore(entry.path)
     }
   }
