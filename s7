@@ -550,7 +550,7 @@ function cipher (key, input, iv = undefined) {
 function decipher (key, stream) {
   return new Promise((resolve, reject) => {
     let decipher
-    let authBuffer
+    let chunkBuffer = Buffer.alloc(0)
     stream.on('error', reject)
     stream.on('readable', () => {
       if (decipher === undefined) {
@@ -567,12 +567,10 @@ function decipher (key, stream) {
       }
       let chunk
       while (decipher !== undefined && (chunk = stream.read()) !== null) {
-        if (authBuffer !== undefined) {
-          decipher.write(authBuffer)
-        }
-        const data = chunk.slice(0, chunk.length - AUTH_LEN_IN_BYTES)
+        chunkBuffer = Buffer.concat([chunkBuffer, chunk])
+        const data = chunkBuffer.slice(0, chunkBuffer.length - AUTH_LEN_IN_BYTES)
         decipher.write(data)
-        authBuffer = chunk.slice(chunk.length - AUTH_LEN_IN_BYTES)
+        chunkBuffer = chunkBuffer.slice(chunkBuffer.length - AUTH_LEN_IN_BYTES)
       }
       if (decipher !== undefined) {
         resolve(decipher)
@@ -581,10 +579,10 @@ function decipher (key, stream) {
     stream.on('end', () => {
       if (decipher === undefined) {
         reject(new Error('Found of end of input before decipher created!'))
-      } else if (authBuffer === undefined) {
+      } else if (chunkBuffer.length === 0) {
         reject(new Error('Auth not set before end of stream!'))
       } else {
-        const auth = authBuffer
+        const auth = chunkBuffer
         decipher.setAuthTag(auth)
         decipher.end()
       }
