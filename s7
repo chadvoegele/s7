@@ -162,11 +162,11 @@ function parseUri (secrets, uri, options) {
     if (splitIdx === -1) {
       const bucket = pathArg
       const prefix = ''
-      io = s3IO.create(secrets.accessKeyId, secrets.secretAccessKey, secrets.region, bucket, prefix, storageClass, restoreRequest)
+      io = s3IO.create(secrets.accessKeyId, secrets.secretAccessKey, secrets.sessionToken, secrets.region, bucket, prefix, storageClass, restoreRequest)
     } else {
       const bucket = pathArg.slice(0, splitIdx)
       const prefix = pathArg.slice(splitIdx + 1)
-      io = s3IO.create(secrets.accessKeyId, secrets.secretAccessKey, secrets.region, bucket, prefix, storageClass, restoreRequest)
+      io = s3IO.create(secrets.accessKeyId, secrets.secretAccessKey, secrets.sessionToken, secrets.region, bucket, prefix, storageClass, restoreRequest)
     }
   } else {
     exitWithMessage(`Unknown scheme ${scheme}`)
@@ -313,8 +313,11 @@ async function * mergeUnsorted (source, target) {
 }
 
 async function copy (sourceIo, targetIo, entry) {
-  console.log(`Copying ${entry.path} from ${sourceIo} to ${targetIo}`)
-  return targetIo.write(entry.path, await sourceIo.read(entry.path))
+  const path = entry.path
+  console.log(`Copying ${path} from ${sourceIo} to ${targetIo}`)
+  const size = await sourceIo.size(path)
+  const stream = await sourceIo.read(path)
+  return targetIo.write(path, stream, size)
 }
 
 async function remove (io, entry) {
@@ -343,11 +346,16 @@ const fsIO = {
       yield entryStats
     }
   },
+  size: async function (name) {
+    const fullPath = path.join(this.root, name)
+    const stats = await fs.promises.lstat(fullPath)
+    return stats.size
+  },
   read: async function (name) {
     const fullPath = path.join(this.root, name)
     return fs.createReadStream(fullPath)
   },
-  write: async function (name, stream) {
+  write: async function (name, stream, size) {
     const fullPath = path.join(this.root, name)
     await fs.promises.mkdir(path.dirname(fullPath), { recursive: true })
     return new Promise((resolve, reject) => {
@@ -376,7 +384,7 @@ function * yieldContents (contents, prefix) {
 }
 
 const s3IO = {
-  create: function (accessKeyId, secretAccessKey, region, bucket, prefix, storageClass = undefined, restoreRequest = undefined) {
+  create: function (accessKeyId, secretAccessKey, sessionToken, region, bucket, prefix, storageClass = undefined, restoreRequest = undefined) {
     const AWS = require('aws-sdk')
 
     const defaultStorageClass = 'DEEP_ARCHIVE'
@@ -407,8 +415,18 @@ const s3IO = {
         value: new AWS.S3({
           accessKeyId: accessKeyId,
           secretAccessKey: secretAccessKey,
+          sessionToken: sessionToken,
           region: region
         })
+      },
+      maxParts: {
+        value: 10000
+      },
+      maxUploadPartSize: {
+        value: 5 * 1024 * 1024 * 1024
+      },
+      minUploadPartSize: {
+        value: 5 * 1024 * 1024
       }
     })
     return s3Io
@@ -433,22 +451,33 @@ const s3IO = {
       yield * yieldContents(objects.Contents, this.prefix)
     }
   },
+  size: async function (name) {
+    const head = await this.head(name)
+    const size = head.ContentLength
+    return size
+  },
   read: async function (name) {
-    var params = {
+    const params = {
       Bucket: this.bucket,
       Key: path.join(this.prefix, name)
     }
     const stream = this.s3.getObject(params).createReadStream()
     return stream
   },
-  write: async function (name, stream) {
+  write: async function (name, stream, size) {
+    const unclippedPartSize = this._adjustPartSize(size)
+    const partSize = this._clipPartSize(unclippedPartSize)
+
     const params = {
       Bucket: this.bucket,
       Key: path.join(this.prefix, name),
       Body: stream,
       StorageClass: this.storageClass
     }
-    const managedUpload = this.s3.upload(params)
+    const options = {
+      partSize: partSize
+    }
+    const managedUpload = this.s3.upload(params, options)
     return managedUpload.promise()
   },
   remove: async function (name) {
@@ -472,6 +501,32 @@ const s3IO = {
       Key: path.join(this.prefix, name),
     }
     return this.s3.headObject(params).promise()
+  },
+  // From https://github.com/boto/s3transfer/blob/8f02523b88c19f84d6f74905e21d209724eced69/s3transfer/utils.py#L749
+  _adjustPartSize: function (size) {
+    let partSize = this.minUploadPartSize
+
+    let numParts = Math.ceil(size / partSize)
+    while (numParts > this.maxParts) {
+      partSize = 2 * partSize
+      numParts = Math.ceil(size / partSize)
+      console.log(`Increasing part size to ${partSize} with numParts ${numParts}`)
+    }
+
+    return partSize
+  },
+  _clipPartSize: function (partSize) {
+    if (partSize > this.maxUploadPartSize) {
+      console.log(`Clipping part size to ${this.maxUploadPartSize} from ${partSize}`)
+      return this.maxUploadPartSize
+    }
+
+    if (partSize < this.minUploadPartSize) {
+      console.log(`Clipping part size to ${this.minUploadPartSize} from ${partSize}`)
+      return this.minUploadPartSize
+    }
+
+    return partSize
   }
 }
 
@@ -483,6 +538,9 @@ const encIO = {
       },
       key: {
         value: key
+      },
+      totalPaddingLengthInBytes: {
+        value: HEADER_LENGTH + IV_LEN_IN_BYTES + AUTH_LEN_IN_BYTES
       }
     })
   },
@@ -494,10 +552,16 @@ const encIO = {
       const entryStats = {
         path: await decryptName(this.key, e.path),
         mtimeMs: e.mtimeMs,
-        size: e.size - HEADER_LENGTH - IV_LEN_IN_BYTES - AUTH_LEN_IN_BYTES
+        size: e.size - this.totalPaddingLengthInBytes
       }
       yield entryStats
     }
+  },
+  size: async function (name) {
+    const encryptedName = await encryptName(this.key, name)
+    const ioSize = await this.io.size(encryptedName)
+    const size = ioSize - this.totalPaddingLengthInBytes
+    return size
   },
   read: async function (name) {
     const encryptedName = await encryptName(this.key, name)
@@ -505,10 +569,11 @@ const encIO = {
     const decryptedStream = await decipher(this.key, encryptedRead)
     return decryptedStream
   },
-  write: async function (name, stream) {
+  write: async function (name, stream, size) {
     const encryptedName = await encryptName(this.key, name)
     const encryptedStream = cipher(this.key, stream)
-    const outStream = await this.io.write(encryptedName, encryptedStream)
+    const encryptedSize = size + this.totalPaddingLengthInBytes
+    const outStream = await this.io.write(encryptedName, encryptedStream, encryptedSize)
     return outStream
   },
   remove: async function (name) {
