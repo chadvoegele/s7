@@ -7,6 +7,7 @@ function main() {
   run_test test_update_different_size
   run_test test_deletion
   run_test test_multiple_files
+  run_test test_encryption_limit
   [[ -n $S7_LONG_TESTS ]] && run_test test_large_file
 
   if [[ -n "$AWS_ACCESS_KEY_ID" && -n "$AWS_SECRET_ACCESS_KEY" && -n "$AWS_DEFAULT_REGION" ]]
@@ -142,6 +143,14 @@ function test_large_file() {
   diff -r "$test_dir/data/in" "$test_dir/data/out"
   diff_exit="$?"
   assert_eq "$diff_exit" "0"
+}
+
+function test_encryption_limit() {
+  test_dir="$1"
+  mkdir -p "$test_dir"/data/{in,enc}
+  fallocate -l 70G "${test_dir}/data/in/data.img"
+  in_sync=$(s7 sync file://"$test_dir/data/in" enc+file://"$test_dir/data/enc")
+  assert_in "$in_sync" "Skipping"
 }
 
 function test_s3() {

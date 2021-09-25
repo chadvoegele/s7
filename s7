@@ -65,7 +65,7 @@ and can be prepended with 'enc+' to enable client-side encryption
 The restore command restores S3 objects from Glacier storage to Standard. This
 is required before syncing if the objects are in Glacier.
 
---restore-request set the RestoreRequest parameters
+--restore-request sets the RestoreRequest parameters
 The default value is
 {
   Days: 5,
@@ -223,24 +223,39 @@ async function sync (sourceIo, targetIo) {
   const stats = {
     added: 0,
     updated: 0,
-    deleted: 0
+    deleted: 0,
+    skipped: 0
   }
-  for await (const action of actions) {
-    if (action.action === 'add') {
-      await copy(sourceIo, targetIo, action.entry)
+
+  for await (const actionEntry of actions) {
+    const action = actionEntry.action
+    const entry = actionEntry.entry
+    const path = entry.path
+
+    if (action === 'add' || action === 'update') {
+      const size = await sourceIo.size(path)
+      if (!targetIo.isWriteSupported(path, size)) {
+        console.log(`Skipping ${path} with size ${size}`)
+        stats.skipped += 1
+        continue
+      }
+    }
+
+    if (action === 'add') {
+      await copy(sourceIo, targetIo, entry)
       stats.added += 1
-    } else if (action.action === 'update') {
-      await copy(sourceIo, targetIo, action.entry)
+    } else if (action === 'update') {
+      await copy(sourceIo, targetIo, entry)
       stats.updated += 1
-    } else if (action.action === 'delete') {
-      await remove(targetIo, action.entry)
+    } else if (action === 'delete') {
+      await remove(targetIo, entry)
       stats.deleted += 1
     } else {
-      const message = `Unknown action ${action.action}`
+      const message = `Unknown action ${action}`
       throw new Error(message)
     }
   }
-  console.log(`Sync finished with ${stats.added} file(s) added, ${stats.updated} file(s) updated, and ${stats.deleted} file(s) deleted`)
+  console.log(`Sync finished with ${stats.added} file(s) added, ${stats.updated} file(s) updated, ${stats.deleted} file(s) deleted, and ${stats.skipped} file(s) skipped.`)
 }
 
 async function restore (s3Io) {
@@ -355,6 +370,9 @@ const fsIO = {
     const fullPath = path.join(this.root, name)
     return fs.createReadStream(fullPath)
   },
+  isWriteSupported: function (name, size) {
+    return true
+  },
   write: async function (name, stream, size) {
     const fullPath = path.join(this.root, name)
     await fs.promises.mkdir(path.dirname(fullPath), { recursive: true })
@@ -422,6 +440,9 @@ const s3IO = {
       maxParts: {
         value: 10000
       },
+      maxUploadSize: {
+        value: 5 * 1024 * 1024 * 1024 * 1024
+      },
       maxUploadPartSize: {
         value: 5 * 1024 * 1024 * 1024
       },
@@ -463,6 +484,9 @@ const s3IO = {
     }
     const stream = this.s3.getObject(params).createReadStream()
     return stream
+  },
+  isWriteSupported: function (name, size) {
+    return size <= this.maxUploadSize
   },
   write: async function (name, stream, size) {
     const unclippedPartSize = this._adjustPartSize(size)
@@ -541,6 +565,9 @@ const encIO = {
       },
       totalPaddingLengthInBytes: {
         value: HEADER_LENGTH + IV_LEN_IN_BYTES + AUTH_LEN_IN_BYTES
+      },
+      maxSize: {
+        value: 64 * 1024 * 1024 * 1024
       }
     })
   },
@@ -568,6 +595,10 @@ const encIO = {
     const encryptedRead = await this.io.read(encryptedName)
     const decryptedStream = await decipher(this.key, encryptedRead)
     return decryptedStream
+  },
+  isWriteSupported: function (name, size) {
+    const encryptedSize = size + this.totalPaddingLengthInBytes
+    return size <= this.maxSize && this.io.isWriteSupported(name, encryptedSize)
   },
   write: async function (name, stream, size) {
     const encryptedName = await encryptName(this.key, name)
